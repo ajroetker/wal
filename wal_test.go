@@ -1494,6 +1494,29 @@ func TestReadMany(t *testing.T) {
 		}
 	})
 
+	t.Run("max-count", func(t *testing.T) {
+		l, err := Open("testlog/many-maxcount", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 5; i++ {
+			if err := l.Write(i, []byte(dataStr(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// math.MaxInt should not overflow — should return all 5 entries
+		results, err := l.ReadMany(1, int(^uint(0)>>1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("expected 5, got %d", len(results))
+		}
+	})
+
 	t.Run("closed", func(t *testing.T) {
 		l, err := Open("testlog/many-closed", &Options{NoSync: true})
 		if err != nil {
@@ -1619,6 +1642,41 @@ func TestReadManyHeaders(t *testing.T) {
 		}
 	})
 
+	t.Run("json-format", func(t *testing.T) {
+		l, err := Open("testlog/manyh-json", &Options{
+			NoSync:      true,
+			LogFormat:   JSON,
+			SegmentSize: 256,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 10; i++ {
+			header := []byte{byte(i), byte(i * 2)}
+			payload := []byte(fmt.Sprintf("json-payload-%d", i))
+			if err := l.Write(i, append(header, payload...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		results, err := l.ReadManyHeaders(1, 10, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 10 {
+			t.Fatalf("expected 10, got %d", len(results))
+		}
+		for i, hdr := range results {
+			idx := uint64(i + 1)
+			expected := []byte{byte(idx), byte(idx * 2)}
+			if !bytes.Equal(hdr, expected) {
+				t.Fatalf("entry %d: got %v, want %v", idx, hdr, expected)
+			}
+		}
+	})
+
 	t.Run("closed", func(t *testing.T) {
 		l, err := Open("testlog/manyh-closed", &Options{NoSync: true})
 		if err != nil {
@@ -1699,8 +1757,8 @@ func TestReadHeader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(data) != 0 {
-				t.Fatalf("expected 0 bytes, got %d", len(data))
+			if data != nil {
+				t.Fatalf("expected nil, got %v", data)
 			}
 
 			// ReadHeader -- not found
@@ -1763,6 +1821,19 @@ func TestReadHeader(t *testing.T) {
 		}
 		l.Close()
 		_, err = l.ReadHeader(1, 4)
+		if err != ErrClosed {
+			t.Fatalf("expected %v, got %v", ErrClosed, err)
+		}
+	})
+
+	t.Run("closed-n-zero", func(t *testing.T) {
+		l, err := Open("testlog/header-closed-nzero", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		// n<=0 on a closed log should still return ErrClosed
+		_, err = l.ReadHeader(1, 0)
 		if err != ErrClosed {
 			t.Fatalf("expected %v, got %v", ErrClosed, err)
 		}
