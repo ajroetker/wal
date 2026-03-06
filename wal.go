@@ -658,26 +658,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	epos := s.epos[index-s.index]
-	edata := s.ebuf[epos.pos:epos.end]
-	if l.opts.LogFormat == JSON {
-		return readJSON(edata)
-	}
-	// binary read
-	size, n := binary.Uvarint(edata)
-	if n <= 0 {
-		return nil, ErrCorrupt
-	}
-	if uint64(len(edata)-n) < size {
-		return nil, ErrCorrupt
-	}
-	if l.opts.NoCopy {
-		data = edata[n : uint64(n)+size]
-	} else {
-		data = make([]byte, size)
-		copy(data, edata[n:])
-	}
-	return data, nil
+	return l.readEntry(s, index)
 }
 
 //go:noinline
@@ -977,6 +958,154 @@ func (l *Log) Sync() error {
 	return l.sfile.Sync()
 }
 
+// readEntry decodes a single entry from the segment buffer. Must be called
+// under at least an RLock.
+func (l *Log) readEntry(s *segment, index uint64) ([]byte, error) {
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		return readJSON(edata)
+	}
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	if l.opts.NoCopy {
+		return edata[n : uint64(n)+size], nil
+	}
+	data := make([]byte, size)
+	copy(data, edata[n:])
+	return data, nil
+}
+
+// ReadMany reads entries from start to start+count-1 (inclusive) in a single
+// call, returning a slice of data for each entry. This is more efficient than
+// calling Read in a loop because it takes the lock once and reuses segment
+// lookups for consecutive entries in the same segment.
+// Entries that fall outside the log's range are not included; the returned
+// slice may be shorter than count.
+func (l *Log) ReadMany(start uint64, count int) ([][]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
+		return nil, ErrClosed
+	}
+	if count <= 0 || l.firstIndex > l.lastIndex {
+		return nil, nil
+	}
+	// Clamp range to valid indices
+	if start < l.firstIndex {
+		start = l.firstIndex
+	}
+	end := start + uint64(count) - 1
+	if end > l.lastIndex {
+		end = l.lastIndex
+	}
+	if start > end {
+		return nil, nil
+	}
+	results := make([][]byte, 0, end-start+1)
+	var curSeg *segment
+	for i := start; i <= end; i++ {
+		// Reuse segment if the current index still belongs to it
+		if curSeg == nil || i < curSeg.index || i >= curSeg.index+uint64(len(curSeg.epos)) {
+			var err error
+			curSeg, err = l.loadSegment(i)
+			if err != nil {
+				return nil, err
+			}
+		}
+		data, err := l.readEntry(curSeg, i)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, data)
+	}
+	return results, nil
+}
+
+// ReadManyHeaders reads the first n bytes of each entry from start to
+// start+count-1 (inclusive) in a single call. This combines the efficiency
+// of ReadMany (single lock, segment reuse) with ReadHeader (partial reads).
+// Entries outside the log's range are not included; the returned slice may
+// be shorter than count.
+func (l *Log) ReadManyHeaders(start uint64, count, n int) ([][]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
+		return nil, ErrClosed
+	}
+	if count <= 0 || n <= 0 || l.firstIndex > l.lastIndex {
+		return nil, nil
+	}
+	if start < l.firstIndex {
+		start = l.firstIndex
+	}
+	end := start + uint64(count) - 1
+	if end > l.lastIndex {
+		end = l.lastIndex
+	}
+	if start > end {
+		return nil, nil
+	}
+	results := make([][]byte, 0, end-start+1)
+	var curSeg *segment
+	for i := start; i <= end; i++ {
+		if curSeg == nil || i < curSeg.index || i >= curSeg.index+uint64(len(curSeg.epos)) {
+			var err error
+			curSeg, err = l.loadSegment(i)
+			if err != nil {
+				return nil, err
+			}
+		}
+		data, err := l.readEntryHeader(curSeg, i, n)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, data)
+	}
+	return results, nil
+}
+
+// readEntryHeader decodes the first n bytes of a single entry from the segment
+// buffer. Always copies the result. Must be called under at least an RLock.
+func (l *Log) readEntryHeader(s *segment, index uint64, n int) ([]byte, error) {
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		full, err := readJSON(edata)
+		if err != nil {
+			return nil, err
+		}
+		if n >= len(full) {
+			return full, nil
+		}
+		data := make([]byte, n)
+		copy(data, full)
+		return data, nil
+	}
+	size, sn := binary.Uvarint(edata)
+	if sn <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-sn) < size {
+		return nil, ErrCorrupt
+	}
+	if uint64(n) > size {
+		n = int(size)
+	}
+	data := make([]byte, n)
+	copy(data, edata[sn:])
+	return data, nil
+}
+
 // ReadHeader returns the first n bytes of the entry data at the given index.
 // If the entry data is shorter than n bytes, the entire data is returned.
 // If n is zero or negative, an empty slice is returned.
@@ -1005,37 +1134,7 @@ func (l *Log) ReadHeader(index uint64, n int) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	epos := s.epos[index-s.index]
-	edata := s.ebuf[epos.pos:epos.end]
-	if l.opts.LogFormat == JSON {
-		// For JSON format, we must decode the full entry first
-		full, err := readJSON(edata)
-		if err != nil {
-			return nil, err
-		}
-		if n >= len(full) {
-			return full, nil
-		}
-		data = make([]byte, n)
-		copy(data, full)
-		return data, nil
-	}
-	// binary read
-	size, sn := binary.Uvarint(edata)
-	if sn <= 0 {
-		return nil, ErrCorrupt
-	}
-	if uint64(len(edata)-sn) < size {
-		return nil, ErrCorrupt
-	}
-	// Clamp n to actual data size
-	if uint64(n) > size {
-		n = int(size)
-	}
-	// Always copy — the segment buffer may be evicted by the LRU cache.
-	data = make([]byte, n)
-	copy(data, edata[sn:])
-	return data, nil
+	return l.readEntryHeader(s, index, n)
 }
 
 // IsEmpty returns true if there are no entries in the log.

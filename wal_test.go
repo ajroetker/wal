@@ -1328,6 +1328,310 @@ func TestEmptyTruncateBackTwice(t *testing.T) {
 	}
 }
 
+func TestReadMany(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	t.Run("basic", func(t *testing.T) {
+		l, err := Open("testlog/many-basic", &Options{
+			NoSync:      true,
+			SegmentSize: 128, // small segments to force cross-segment reads
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 50; i++ {
+			if err := l.Write(i, []byte(dataStr(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Read all entries
+		results, err := l.ReadMany(1, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 50 {
+			t.Fatalf("expected 50, got %d", len(results))
+		}
+		for i, data := range results {
+			expected := dataStr(uint64(i + 1))
+			if string(data) != expected {
+				t.Fatalf("entry %d: got %q, want %q", i+1, data, expected)
+			}
+		}
+	})
+
+	t.Run("partial-range", func(t *testing.T) {
+		l, err := Open("testlog/many-partial", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 100; i++ {
+			if err := l.Write(i, []byte(dataStr(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Read middle range
+		results, err := l.ReadMany(25, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 10 {
+			t.Fatalf("expected 10, got %d", len(results))
+		}
+		for i, data := range results {
+			expected := dataStr(uint64(25 + i))
+			if string(data) != expected {
+				t.Fatalf("got %q, want %q", data, expected)
+			}
+		}
+	})
+
+	t.Run("clamp-to-bounds", func(t *testing.T) {
+		l, err := Open("testlog/many-clamp", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 10; i++ {
+			if err := l.Write(i, []byte(dataStr(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Request more than available
+		results, err := l.ReadMany(1, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 10 {
+			t.Fatalf("expected 10, got %d", len(results))
+		}
+
+		// Start before firstIndex
+		if err := l.TruncateFront(5); err != nil {
+			t.Fatal(err)
+		}
+		results, err = l.ReadMany(1, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 6 {
+			t.Fatalf("expected 6, got %d", len(results))
+		}
+		if string(results[0]) != dataStr(5) {
+			t.Fatalf("first entry: got %q, want %q", results[0], dataStr(5))
+		}
+	})
+
+	t.Run("empty-and-zero", func(t *testing.T) {
+		l, err := Open("testlog/many-empty", &Options{
+			NoSync:     true,
+			AllowEmpty: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		// Empty log
+		results, err := l.ReadMany(1, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results != nil {
+			t.Fatalf("expected nil, got %v", results)
+		}
+
+		// Zero count
+		if err := l.Write(1, []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		results, err = l.ReadMany(1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results != nil {
+			t.Fatalf("expected nil, got %v", results)
+		}
+	})
+
+	t.Run("matches-read", func(t *testing.T) {
+		l, err := Open("testlog/many-match", &Options{
+			NoSync:      true,
+			SegmentSize: 64,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 30; i++ {
+			if err := l.Write(i, []byte(dataStr(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		results, err := l.ReadMany(1, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, data := range results {
+			single, err := l.Read(uint64(i + 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(data, single) {
+				t.Fatalf("entry %d: ReadMany != Read", i+1)
+			}
+		}
+	})
+
+	t.Run("closed", func(t *testing.T) {
+		l, err := Open("testlog/many-closed", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		_, err = l.ReadMany(1, 10)
+		if err != ErrClosed {
+			t.Fatalf("expected %v, got %v", ErrClosed, err)
+		}
+	})
+}
+
+func TestReadManyHeaders(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	t.Run("basic", func(t *testing.T) {
+		l, err := Open("testlog/manyh-basic", &Options{
+			NoSync:      true,
+			SegmentSize: 128,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 20; i++ {
+			header := []byte{byte(i), byte(i * 2)}
+			payload := make([]byte, 30) // large payload we don't want to copy
+			if err := l.Write(i, append(header, payload...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		results, err := l.ReadManyHeaders(1, 20, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 20 {
+			t.Fatalf("expected 20, got %d", len(results))
+		}
+		for i, hdr := range results {
+			idx := uint64(i + 1)
+			expected := []byte{byte(idx), byte(idx * 2)}
+			if !bytes.Equal(hdr, expected) {
+				t.Fatalf("entry %d: got %v, want %v", idx, hdr, expected)
+			}
+		}
+	})
+
+	t.Run("matches-read-header", func(t *testing.T) {
+		l, err := Open("testlog/manyh-match", &Options{
+			NoSync:      true,
+			SegmentSize: 64,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		for i := uint64(1); i <= 30; i++ {
+			header := []byte{byte(i), byte(i * 3), byte(i * 5), byte(i * 7)}
+			payload := []byte(fmt.Sprintf("payload-%d", i))
+			if err := l.Write(i, append(header, payload...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		results, err := l.ReadManyHeaders(1, 30, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, hdr := range results {
+			single, err := l.ReadHeader(uint64(i+1), 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(hdr, single) {
+				t.Fatalf("entry %d: ReadManyHeaders != ReadHeader", i+1)
+			}
+		}
+	})
+
+	t.Run("clamp-and-empty", func(t *testing.T) {
+		l, err := Open("testlog/manyh-clamp", &Options{
+			NoSync:     true,
+			AllowEmpty: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		// Empty log
+		results, err := l.ReadManyHeaders(1, 10, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results != nil {
+			t.Fatalf("expected nil, got %v", results)
+		}
+
+		// Zero count
+		if err := l.Write(1, []byte{1, 2, 3, 4}); err != nil {
+			t.Fatal(err)
+		}
+		results, err = l.ReadManyHeaders(1, 0, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results != nil {
+			t.Fatalf("expected nil, got %v", results)
+		}
+
+		// Zero header size
+		results, err = l.ReadManyHeaders(1, 1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results != nil {
+			t.Fatalf("expected nil, got %v", results)
+		}
+	})
+
+	t.Run("closed", func(t *testing.T) {
+		l, err := Open("testlog/manyh-closed", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		_, err = l.ReadManyHeaders(1, 10, 4)
+		if err != ErrClosed {
+			t.Fatalf("expected %v, got %v", ErrClosed, err)
+		}
+	})
+}
+
 func TestReadHeader(t *testing.T) {
 	os.RemoveAll("testlog")
 	defer os.RemoveAll("testlog")
