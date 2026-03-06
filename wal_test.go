@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -1325,6 +1326,187 @@ func TestEmptyTruncateBackTwice(t *testing.T) {
 	if !empty {
 		t.Fatalf("expected %v, got %v", true, empty)
 	}
+}
+
+func TestReadHeader(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	for _, format := range []struct {
+		name string
+		fmt  LogFormat
+	}{
+		{"binary", Binary},
+		{"json", JSON},
+	} {
+		t.Run(format.name, func(t *testing.T) {
+			logPath := "testlog/header-" + format.name
+			l, err := Open(logPath, &Options{
+				NoSync:    true,
+				LogFormat: format.fmt,
+				NoCopy:    false,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+
+			// Write entries with known headers:
+			// 4-byte header prefix + payload
+			for i := uint64(1); i <= 10; i++ {
+				header := []byte{byte(i), byte(i * 2), byte(i * 3), byte(i * 4)}
+				payload := []byte(fmt.Sprintf("payload-for-entry-%d-with-extra-data", i))
+				entry := append(header, payload...)
+				if err := l.Write(i, entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// ReadHeader -- read 4-byte header from each entry
+			for i := uint64(1); i <= 10; i++ {
+				header, err := l.ReadHeader(i, 4)
+				if err != nil {
+					t.Fatalf("ReadHeader(%d, 4): %v", i, err)
+				}
+				expected := []byte{byte(i), byte(i * 2), byte(i * 3), byte(i * 4)}
+				if !bytes.Equal(header, expected) {
+					t.Fatalf("entry %d: header = %v, want %v", i, header, expected)
+				}
+			}
+
+			// ReadHeader -- request more bytes than entry has
+			short := []byte{1, 2}
+			if err := l.Write(11, short); err != nil {
+				t.Fatal(err)
+			}
+			data, err := l.ReadHeader(11, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) != 2 {
+				t.Fatalf("expected 2 bytes, got %d", len(data))
+			}
+			if data[0] != 1 || data[1] != 2 {
+				t.Fatalf("expected [1 2], got %v", data)
+			}
+
+			// ReadHeader -- request 0 bytes
+			data, err = l.ReadHeader(1, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) != 0 {
+				t.Fatalf("expected 0 bytes, got %d", len(data))
+			}
+
+			// ReadHeader -- not found
+			_, err = l.ReadHeader(999, 4)
+			if err != ErrNotFound {
+				t.Fatalf("expected %v, got %v", ErrNotFound, err)
+			}
+
+			// ReadHeader -- verify it matches full Read
+			for i := uint64(1); i <= 10; i++ {
+				full, err := l.Read(i)
+				if err != nil {
+					t.Fatal(err)
+				}
+				header, err := l.ReadHeader(i, 4)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(header, full[:len(header)]) {
+					t.Fatalf("entry %d: ReadHeader = %v, want %v",
+						i, header, full[:len(header)])
+				}
+			}
+		})
+	}
+
+	t.Run("nocopy", func(t *testing.T) {
+		logPath := "testlog/header-nocopy"
+		l, err := Open(logPath, &Options{
+			NoSync: true,
+			NoCopy: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		entry := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+		if err := l.Write(1, entry); err != nil {
+			t.Fatal(err)
+		}
+
+		header, err := l.ReadHeader(1, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(header) != 4 {
+			t.Fatalf("expected 4 bytes, got %d", len(header))
+		}
+		expected := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+		if !bytes.Equal(header, expected) {
+			t.Fatalf("header = %v, want %v", header, expected)
+		}
+	})
+
+	t.Run("closed", func(t *testing.T) {
+		l, err := Open("testlog/header-closed", &Options{NoSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		_, err = l.ReadHeader(1, 4)
+		if err != ErrClosed {
+			t.Fatalf("expected %v, got %v", ErrClosed, err)
+		}
+	})
+
+	t.Run("after-truncate", func(t *testing.T) {
+		logPath := "testlog/header-truncate"
+		l, err := Open(logPath, &Options{
+			NoSync:      true,
+			SegmentSize: 128, // small segments to test cross-segment reads
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		// Write entries across multiple segments
+		for i := uint64(1); i <= 50; i++ {
+			header := []byte{byte(i), byte(i)}
+			payload := make([]byte, 20)
+			entry := append(header, payload...)
+			if err := l.Write(i, entry); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Truncate front
+		if err := l.TruncateFront(25); err != nil {
+			t.Fatal(err)
+		}
+
+		// Should be able to read headers of remaining entries
+		for i := uint64(25); i <= 50; i++ {
+			header, err := l.ReadHeader(i, 2)
+			if err != nil {
+				t.Fatalf("ReadHeader(%d, 2) after truncate: %v", i, err)
+			}
+			if header[0] != byte(i) || header[1] != byte(i) {
+				t.Fatalf("entry %d: expected [%d %d], got %v", i, i, i, header)
+			}
+		}
+
+		// Truncated entries should not be found
+		_, err = l.ReadHeader(1, 2)
+		if err != ErrNotFound {
+			t.Fatalf("expected %v, got %v", ErrNotFound, err)
+		}
+	})
 }
 
 func TestIssue33(t *testing.T) {

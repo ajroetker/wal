@@ -977,6 +977,67 @@ func (l *Log) Sync() error {
 	return l.sfile.Sync()
 }
 
+// ReadHeader returns the first n bytes of the entry data at the given index.
+// If the entry data is shorter than n bytes, the entire data is returned.
+// If n is zero or negative, an empty slice is returned.
+// This is useful for reading fixed-size metadata headers from entries without
+// copying the full payload. The returned data is always a copy, even when the
+// NoCopy option is set, because header reads are small and the segment buffer
+// may be evicted by the LRU cache.
+func (l *Log) ReadHeader(index uint64, n int) (data []byte, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
+		return nil, ErrClosed
+	}
+	if n <= 0 {
+		return []byte{}, nil
+	}
+	if l.firstIndex > l.lastIndex {
+		return nil, ErrNotFound
+	}
+	if index < l.firstIndex || index > l.lastIndex {
+		return nil, ErrNotFound
+	}
+	s, err := l.loadSegment(index)
+	if err != nil {
+		return nil, err
+	}
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		// For JSON format, we must decode the full entry first
+		full, err := readJSON(edata)
+		if err != nil {
+			return nil, err
+		}
+		if n >= len(full) {
+			return full, nil
+		}
+		data = make([]byte, n)
+		copy(data, full)
+		return data, nil
+	}
+	// binary read
+	size, sn := binary.Uvarint(edata)
+	if sn <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-sn) < size {
+		return nil, ErrCorrupt
+	}
+	// Clamp n to actual data size
+	if uint64(n) > size {
+		n = int(size)
+	}
+	// Always copy — the segment buffer may be evicted by the LRU cache.
+	data = make([]byte, n)
+	copy(data, edata[sn:])
+	return data, nil
+}
+
 // IsEmpty returns true if there are no entries in the log.
 func (l *Log) IsEmpty() (bool, error) {
 	l.mu.Lock()
